@@ -1,0 +1,110 @@
+import { readFile } from "node:fs/promises";
+import { identityMode } from "../lib/identity-mode";
+import { randomBytes } from "node:crypto";
+import { Pool } from "pg";
+import { portalOidcClients, resolvePortalOrigins } from "@aura/contracts";
+
+import { auth } from "../lib/auth";
+
+const databaseUrl = process.env.DATABASE_URL_UNPOOLED ?? process.env.DATABASE_URL;
+const databaseSchema = process.env.AUTH_DATABASE_SCHEMA ?? "aura_identity";
+
+if (!databaseUrl) throw new Error("Database URL is required");
+
+const clients = [
+  { id: "student", name: "AURA Student Portal" },
+  { id: "parent", name: "AURA Parent Portal" },
+  { id: "faculty", name: "AURA Faculty Portal" },
+  { id: "hod", name: "AURA HOD Portal" },
+  { id: "governance", name: "AURA AI Governance" },
+  { id: "lms", name: "AURA Learning Portal" },
+] as const;
+const clientProfile = process.env.AURA_CLIENT_PROFILE ?? "production";
+if (!["local", "production"].includes(clientProfile)) throw new Error("AURA_CLIENT_PROFILE must be local or production");
+const allOrigins = resolvePortalOrigins(process.env.AURA_PORTAL_ORIGINS_JSON);
+const portalOrigins = Object.fromEntries(Object.entries(allOrigins).map(([id, origins]) => [id, origins.filter(origin => {
+  const url = new URL(origin);
+  return clientProfile === "local" ? url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) : url.protocol === "https:";
+})])) as typeof allOrigins;
+
+const pool = new Pool({
+  connectionString: databaseUrl,
+  options: `-c search_path=${databaseSchema}`,
+});
+
+const result: Record<string, string> = {};
+
+try {
+  const missing = [];
+  for (const client of clients) {
+    const existing = await pool.query<{ clientId: string }>(
+      'SELECT "clientId" FROM "oauthClient" WHERE "name" = $1 LIMIT 1',
+      [client.name],
+    );
+    if (existing.rows[0]) {
+      if (existing.rows[0].clientId !== portalOidcClients[client.id]) {
+        throw new Error(`${client.name} client ID does not match the checked-in portal contract`);
+      }
+      await pool.query(
+        `UPDATE "oauthClient" SET "redirectUris" = $2::jsonb, "postLogoutRedirectUris" = $3::jsonb, "updatedAt" = now()
+         WHERE "clientId" = $1`,
+        [
+          existing.rows[0].clientId,
+          JSON.stringify(portalOrigins[client.id].map((origin) => `${origin}/api/auth/callback/aura`)),
+          JSON.stringify(portalOrigins[client.id].map((origin) => `${origin}/`)),
+        ],
+      );
+      result[client.id] = existing.rows[0].clientId;
+      continue;
+    }
+
+    missing.push(client);
+  }
+
+  if (missing.length) {
+    const bootstrapPassword = `${randomBytes(30).toString("base64url")}aA1!`;
+    const operator = identityMode() === "college-project" ? (JSON.parse(await readFile(new URL("../../../../runtime/project-final/accounts.json",import.meta.url),"utf8")) as Array<{role:string;email:string;password:string}>).find(account=>account.role === "governance") : undefined;
+    if(identityMode() === "college-project" && !operator) throw new Error("Hosted OAuth provisioning requires the existing project Operations account");
+    const bootstrapResponse = operator ? await auth.api.signInEmail({asResponse:true,body:{email:operator.email,password:operator.password}}) : await auth.api.signUpEmail({
+      asResponse: true,
+      body: {
+        email: `client-provisioner-${Date.now()}@aura.synthetic.test`,
+        name: "Synthetic OAuth Client Provisioner",
+        password: bootstrapPassword,
+      },
+    });
+    if (!bootstrapResponse.ok) throw new Error(`Bootstrap session failed with ${bootstrapResponse.status}`);
+    const cookie = bootstrapResponse.headers.get("set-cookie");
+    if (!cookie) throw new Error("Bootstrap session did not return a cookie");
+    const headers = new Headers({ cookie });
+
+    for (const client of missing) {
+      const created = await auth.api.adminCreateOAuthClient({
+        headers,
+        body: {
+          client_name: client.name,
+          redirect_uris: portalOrigins[client.id].map((origin) => `${origin}/api/auth/callback/aura`),
+          post_logout_redirect_uris: portalOrigins[client.id].map((origin) => `${origin}/`),
+          token_endpoint_auth_method: "none",
+          application_type: clientProfile === "local" ? "native" : "web",
+          grant_types: ["authorization_code", "refresh_token"],
+          response_types: ["code"],
+          require_pkce: true,
+          skip_consent: true,
+          enable_end_session: true,
+        },
+      });
+      // Bind newly created public PKCE clients to the checked-in portal contract.
+      const normalized = await pool.query(
+        'UPDATE "oauthClient" SET "clientId" = $2 WHERE "clientId" = $1 RETURNING "clientId"',
+        [created.client_id, portalOidcClients[client.id]],
+      );
+      if (normalized.rowCount !== 1) throw new Error(`Could not bind ${client.name} to the portal contract`);
+      result[client.id] = portalOidcClients[client.id];
+    }
+  }
+} finally {
+  await pool.end();
+}
+
+console.log(JSON.stringify(result, null, 2));

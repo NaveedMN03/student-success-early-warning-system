@@ -1,0 +1,70 @@
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { Pool } from "pg";
+import { loadCoreConfig, quoteIdentifier } from "./config";
+
+const migrations = [
+  { id: "001_core", url: new URL("../migrations/001_core.sql", import.meta.url) },
+  { id: "002_parent_grant_revision", url: new URL("../migrations/002_parent_grant_revision.sql", import.meta.url) },
+  { id: "003_replay_idempotency", url: new URL("../migrations/003_replay_idempotency.sql", import.meta.url) },
+  { id: "004_chapter11", url: new URL("../migrations/004_chapter11.sql", import.meta.url) },
+  { id: "005_lms", url: new URL("../migrations/005_lms.sql", import.meta.url) },
+  { id: "006_portal_experience", url: new URL("../migrations/006_portal_experience.sql", import.meta.url) },
+  { id: "007_fee_origin", url: new URL("../migrations/007_fee_origin.sql", import.meta.url) },
+  { id: "008_ch11_escalation", url: new URL("../migrations/008_ch11_escalation.sql", import.meta.url) },
+  { id: "009_ch11_publications", url: new URL("../migrations/009_ch11_publications.sql", import.meta.url) },
+  { id: "010_ch11_policy_scoring", url: new URL("../migrations/010_ch11_policy_scoring.sql", import.meta.url) },
+  { id: "011_data_refresh", url: new URL("../migrations/011_data_refresh.sql", import.meta.url) },
+  { id: "012_device_tokens", url: new URL("../migrations/012_device_tokens.sql", import.meta.url) },
+  { id: "013_informational_records", url: new URL("../migrations/013_informational_records.sql", import.meta.url) },
+  { id: "014_meeting_records", url: new URL("../migrations/014_meeting_records.sql", import.meta.url) },
+  { id: "015_meeting_timeline", url: new URL("../migrations/015_meeting_timeline.sql", import.meta.url) },
+  { id: "016_staff_messages", url: new URL("../migrations/016_staff_messages.sql", import.meta.url) },
+];
+
+export async function migrateCoreDatabase(): Promise<void> {
+  const config = loadCoreConfig();
+  const schema = quoteIdentifier(config.databaseSchema);
+  const pool = new Pool({ connectionString: config.databaseUrl, max: 1 });
+  const client = await pool.connect();
+
+  try {
+    await client.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
+    await client.query("BEGIN");
+    await client.query(`SET LOCAL search_path TO ${schema}, public`);
+    await client.query("SELECT pg_advisory_xact_lock($1)", [420041]);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        id text PRIMARY KEY,
+        checksum text NOT NULL,
+        applied_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+
+    for (const migration of migrations) {
+      const sql = await readFile(migration.url, "utf8");
+      const checksum = createHash("sha256").update(sql).digest("hex");
+      const existing = await client.query<{ checksum: string }>("SELECT checksum FROM schema_migrations WHERE id = $1", [
+        migration.id,
+      ]);
+
+      if (existing.rowCount) {
+        if (existing.rows[0]?.checksum !== checksum) {
+          throw new Error(`Migration ${migration.id} changed after it was applied`);
+        }
+        continue;
+      }
+
+      await client.query(sql);
+      await client.query("INSERT INTO schema_migrations (id, checksum) VALUES ($1, $2)", [migration.id, checksum]);
+    }
+
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+    await pool.end();
+  }
+}

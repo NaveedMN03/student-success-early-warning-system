@@ -1,0 +1,10 @@
+{
+  "status": "passed",
+  "sourceCommit": "5d78a57310c2f0922065f5fdd8dfadf3cab645ac",
+  "sourceTreeDirty": true,
+  "bundle": "streamlit_app/engine.mjs",
+  "inputFiles": 283,
+  "inputsSha256": "5789b253f6dec60a1cc75bf1828ad8f1863900540678cfacd17665b38b2fef86",
+  "bytes": 1478165,
+  "engineSha256": "fa1f6a650ac057b7db013c414b422927d8508e51b9fa3bca1aee93f2234c7926"
+}
