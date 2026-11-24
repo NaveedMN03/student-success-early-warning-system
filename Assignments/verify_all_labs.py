@@ -1,14 +1,14 @@
 """Automated verification harness for all 12 AURA lab assignments.
 
-Compiles each lab script with `py_compile` and executes it as an isolated
-subprocess from BOTH the repository root and the lab's own directory (24 runs),
-using PYTHONDONTWRITEBYTECODE=1 so zero untracked cache artifacts remain.
+Syntax-checks each lab script in memory (`compile(..., 'exec')`) and executes it
+as an isolated subprocess from BOTH the repository root and the lab's own
+directory (24 runs), using `-B` / PYTHONDONTWRITEBYTECODE=1 so zero untracked
+cache artifacts remain.
 """
 
 from __future__ import annotations
 
 import os
-import py_compile
 import subprocess
 import sys
 import time
@@ -54,7 +54,7 @@ def main() -> int:
 
     all_passed = True
     for script in scripts:
-        py_compile.compile(str(script), doraise=True)
+        compile(script.read_text(encoding="utf-8"), str(script), "exec")
         ok_root, ms_root, detail_root = run_check(script, repo_root)
         ok_lab, ms_lab, detail_lab = run_check(script, script.parent)
         all_passed = all_passed and ok_root and ok_lab
